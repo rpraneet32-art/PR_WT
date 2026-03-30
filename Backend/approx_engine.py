@@ -21,7 +21,10 @@ def _get_sample_fraction(accuracy: float) -> float:
     return min_frac * ((max_frac / min_frac) ** t)
 
 _SHUFFLED_DF_CACHE = None
-
+def clear_cache():
+    """Wipes the RAM cache so a new custom dataset can be loaded."""
+    global _SHUFFLED_DF_CACHE
+    _SHUFFLED_DF_CACHE = None
 class ApproxEngine:
     def __init__(self, df: pd.DataFrame, accuracy_target: float = 0.95):
         global _SHUFFLED_DF_CACHE

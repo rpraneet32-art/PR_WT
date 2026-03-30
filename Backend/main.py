@@ -3,7 +3,8 @@ main.py
 --------
 FastAPI application — the main entry point for the backend.
 """
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+import shutil
 import os
 import time
 from typing import Optional
@@ -186,3 +187,48 @@ def _dispatch_query(req: QueryRequest, engine_type: str) -> dict:
             return engine.group_by(req.group_by_column or "product_category", req.column, req.agg_func or "AVG", req.where)
 
     return {"error": f"Unknown query type: {query_type}"}
+@app.post("/api/upload")
+async def upload_custom_dataset(file: UploadFile = File(...)):
+    """Allows users to upload their own CSV or Parquet files for real-world testing!"""
+    global exact_engine, df_full
+    
+    try:
+        # 1. Save the uploaded file temporarily
+        file_ext = file.filename.split('.')[-1].lower()
+        temp_path = os.path.join(DATA_DIR, f"uploaded_temp.{file_ext}")
+        
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # 2. Convert to Parquet if it's a CSV (DuckDB and Pandas prefer Parquet)
+        final_path = os.path.join(DATA_DIR, "custom_dataset.parquet")
+        if file_ext == "csv":
+            print("⏳ Converting uploaded CSV to Parquet for performance...")
+            import pandas as pd
+            temp_df = pd.read_csv(temp_path)
+            temp_df.to_parquet(final_path)
+            os.remove(temp_path)
+        else:
+            # If it's already a parquet, just rename it
+            os.rename(temp_path, final_path)
+
+        # 3. CLEAR THE APPROX ENGINE CACHE (Crucial step!)
+        from approx_engine import clear_cache
+        clear_cache()
+
+        # 4. Hot-Swap the Exact Engine
+        print("🔄 Hot-swapping to new custom dataset...")
+        exact_engine = ExactEngine(final_path)
+        df_full = exact_engine.get_dataframe()
+        
+        return {
+            "status": "success",
+            "message": f"Successfully loaded {file.filename}!",
+            "new_total_rows": exact_engine.total_rows,
+            "columns": exact_engine.get_columns()
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Failed to process file: {str(e)}"}
