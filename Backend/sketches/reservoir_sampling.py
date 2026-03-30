@@ -1,13 +1,13 @@
-from datasketch import HyperLogLog
+import pandas as pd
 
-def hll_count_distinct(values, precision=10):
+def reservoir_sample(df, k):
     """
-    Approximate COUNT DISTINCT using HyperLogLog
-    precision: higher = more accuracy (4–16 recommended)
+    Optimized Sampling: Replaces the slow Python 'for' loop 
+    with highly optimized Pandas vectorized sampling.
     """
-    hll = HyperLogLog(p=precision)
-
-    for val in values:
-        hll.update(str(val).encode())
-
-    return int(hll.count())
+    n = len(df)
+    if k >= n:
+        return df
+    
+    # df.sample uses fast PRNG under the hood, acting as an instant reservoir
+    return df.sample(n=k)
