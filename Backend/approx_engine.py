@@ -1,68 +1,143 @@
-import pandas as pd
+"""
+approx_engine.py
+-----------------
+Approximate Query Engine
+"""
+
 import time
-import os
+import numpy as np
+import pandas as pd
+from typing import Optional, Dict, Any
+
+# --- PATH FIX: Direct import from sketches folder ---
+from sketches.count_min_sketch import CountMinSketch
+from sketches.hll_wrapper import HLLCounter
+
+def _get_sample_fraction(accuracy: float) -> float:
+    min_frac = 0.01
+    max_frac = 0.25
+    t = (accuracy - 0.80) / (0.99 - 0.80)
+    t = max(0.0, min(1.0, t))
+    return min_frac * ((max_frac / min_frac) ** t)
+
+_SHUFFLED_DF_CACHE = None
 
 class ApproxEngine:
-    def __init__(self, db_path="data/ecommerce.parquet"):
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = os.path.join(current_dir, "data", "ecommerce.parquet")
-        
-        try:
-            print("🏗️ Loading Pre-Computed RAM Synopsis...")
-            # 1. Load the raw data ONCE
-            full_df = pd.read_parquet(full_path)
-            self.total_rows = len(full_df)
+    def __init__(self, df: pd.DataFrame, accuracy_target: float = 0.95):
+        global _SHUFFLED_DF_CACHE
+        if _SHUFFLED_DF_CACHE is None:
+            print("⏳ Pre-shuffling static dataframe for O(1) random sampling...")
+            _SHUFFLED_DF_CACHE = df.sample(frac=1.0, random_state=42)
             
-            # 2. THE ENTERPRISE AQP SECRET: 
-            # Pre-shuffle and hold exactly 10% of the data in pure RAM permanently.
-            self.synopsis = full_df.sample(frac=0.10, random_state=42).reset_index(drop=True)
-            print(f"⚡ RAM Synopsis Ready! Holding {len(self.synopsis)} rows in pure memory without SQL overhead.")
-            
-        except Exception as e:
-            print(f"⚠️ Warning: ApproxEngine could not load dataset. Error: {e}")
+        self.df = _SHUFFLED_DF_CACHE
+        self.total_rows = len(df)
+        self.accuracy_target = max(0.80, min(0.99, accuracy_target))
+        self.sample_fraction = _get_sample_fraction(self.accuracy_target)
+        
+        self.sample_size = max(1000, int(self.total_rows * self.sample_fraction))
+        self.sample_size = min(self.sample_size, self.total_rows)
 
-    def run_approx_query(self, query_type, column, group_by=None, accuracy=0.95):
-        # 1. Map accuracy to sample size
-        base_fraction = (accuracy - 0.8) / 2  
-        sample_percent = max(1, min(int(base_fraction * 100), 10)) 
-        
-        # Calculate exactly how many rows we need
-        rows_to_read = int(self.total_rows * (sample_percent / 100))
+    def _get_base_sample(self) -> pd.DataFrame:
+        return self.df.head(self.sample_size)
 
-        # 2. START THE CLOCK
-        start_time = time.perf_counter()
-        
-        # 3. INSTANT SLICE: Grab the top N rows from RAM (O(1) time complexity, no random generation needed)
-        active_sample = self.synopsis.head(rows_to_read)
-        
-        # 4. PURE VECTORIZED MATH (Bypassing SQL parsing)
-        q_type = query_type.upper()
-        
-        # Scale sums and counts, but averages stay the same
-        scale_factor = self.total_rows / rows_to_read if q_type in ["SUM", "COUNT"] else 1.0
-
-        if group_by:
-            if q_type == "COUNT":
-                raw_res = active_sample.groupby(group_by)[column].count()
-            elif q_type == "SUM":
-                raw_res = active_sample.groupby(group_by)[column].sum()
-            elif q_type == "AVG":
-                raw_res = active_sample.groupby(group_by)[column].mean()
-            
-            # Scale group by dict
-            result_value = (raw_res * scale_factor).to_dict()
+    def count(self, column: str = "*", where: Optional[str] = None) -> Dict[str, Any]:
+        start = time.perf_counter()
+        if not where:
+            result = self.total_rows
+            technique = "Exact (O(1))"
         else:
-            if q_type == "COUNT":
-                raw_res = active_sample[column].count()
-            elif q_type == "SUM":
-                raw_res = active_sample[column].sum()
-            elif q_type == "AVG":
-                raw_res = active_sample[column].mean()
-                
-            result_value = float(raw_res * scale_factor)
+            sample = self._get_base_sample()
+            filtered_sample = self._apply_where(sample, where)
+            ratio = len(filtered_sample) / max(len(sample), 1)
+            result = int(ratio * self.total_rows)
+            technique = "Sample-based proportion (CMS concept)"
+        elapsed = time.perf_counter() - start
+        return {"query_type": "COUNT", "result": int(result), "time_ms": round(max(elapsed * 1000, 0.01), 2), "engine": "approximate", "technique": technique}
 
-        # 5. STOP THE CLOCK
-        end_time = time.perf_counter()
-        execution_time_ms = (end_time - start_time) * 1000  
+    def count_distinct(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
+        start = time.perf_counter()
+        sample = self._get_base_sample()
+        if where:
+            sample = self._apply_where(sample, where)
+        hll = HLLCounter.from_accuracy_target(self.accuracy_target)
+        for v in sample[column].values:
+            hll.add(v)
+        raw_estimate = hll.estimate_cardinality()
+        scale = self.total_rows / max(self.sample_size, 1) if not where else 1.0
+        
+        if raw_estimate < 20: 
+            result = raw_estimate 
+        else:
+            sub_ratio = len(sample) / max(self.sample_size, 1)
+            result = raw_estimate * (scale ** 0.5) * sub_ratio
+        elapsed = time.perf_counter() - start
+        return {"query_type": "COUNT_DISTINCT", "result": int(result), "time_ms": round(max(elapsed * 1000, 0.01), 2), "engine": "approximate"}
 
-        return result_value, execution_time_ms, sample_percent
+    def sum(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
+        start = time.perf_counter()
+        sample = self._get_base_sample()
+        if where:
+            sample = self._apply_where(sample, where)
+        if len(sample) == 0:
+            result = 0.0
+        else:
+            sample_mean = float(sample[column].mean())
+            if where:
+                ratio = len(sample) / max(self.sample_size, 1)
+                estimated_n = ratio * self.total_rows
+            else:
+                estimated_n = self.total_rows
+            result = sample_mean * estimated_n
+        elapsed = time.perf_counter() - start
+        return {"query_type": "SUM", "result": round(result, 2), "time_ms": round(max(elapsed * 1000, 0.01), 2), "engine": "approximate"}
+
+    def avg(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
+        start = time.perf_counter()
+        sample = self._get_base_sample()
+        if where:
+            sample = self._apply_where(sample, where)
+        result = float(sample[column].mean()) if len(sample) > 0 else 0.0
+        elapsed = time.perf_counter() - start
+        return {"query_type": "AVG", "result": round(result, 2), "time_ms": round(max(elapsed * 1000, 0.01), 2), "engine": "approximate"}
+
+    def group_by(self, group_column: str, agg_column: str, agg_func: str = "AVG", where: Optional[str] = None) -> Dict[str, Any]:
+        start = time.perf_counter()
+        sample = self._get_base_sample()
+        if where:
+            sample = self._apply_where(sample, where)
+        ratio = len(sample) / max(self.sample_size, 1)
+        estimated_n = ratio * self.total_rows if where else self.total_rows
+        scale = estimated_n / max(len(sample), 1) if len(sample) > 0 else 1.0
+
+        agg_func_lower = agg_func.lower()
+        if agg_func_lower == "avg":
+            grouped = sample.groupby(group_column)[agg_column].mean()
+        elif agg_func_lower == "sum":
+            grouped = sample.groupby(group_column)[agg_column].sum() * scale
+        elif agg_func_lower == "count":
+            grouped = sample.groupby(group_column)[agg_column].count() * scale
+        else:
+            grouped = sample.groupby(group_column)[agg_column].mean()
+
+        result = {str(k): round(float(v), 2) for k, v in grouped.items()}
+        elapsed = time.perf_counter() - start
+        return {"query_type": "GROUP_BY", "result": result, "time_ms": round(max(elapsed * 1000, 0.01), 2), "engine": "approximate"}
+
+    def _apply_where(self, df: pd.DataFrame, where: str) -> pd.DataFrame:
+        where = where.strip()
+        for op in [">=", "<=", "!=", "==", "=", ">", "<"]:
+            if op in where:
+                parts = where.split(op, 1)
+                col = parts[0].strip()
+                val = parts[1].strip().strip("'\"")
+                if col not in df.columns:
+                    return df
+                try:
+                    op_normalized = "==" if op == "=" else op
+                    if df[col].dtype == "object":
+                        return df.query(f"`{col}` {op_normalized} '{val}'")
+                    else:
+                        return df.query(f"`{col}` {op_normalized} {val}")
+                except:
+                    pass
+        return df

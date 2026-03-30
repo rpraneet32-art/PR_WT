@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live AQP Stream Test</title>
+    <style>
+        body { font-family: monospace; background: #1e1e1e; color: #00ff00; padding: 20px; }
+        #data { white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h2>🟢 Live Streaming Engine Output</h2>
+    <div id="data">Waiting for connection...</div>
+
+    <script>
+        // Connect to your FastAPI WebSocket
+        const ws = new WebSocket("ws://127.0.0.1:8000/ws/stream");
+        const dataDiv = document.getElementById("data");
+
+        ws.onopen = () => dataDiv.innerText = "Connected! Waiting for data...\n\n";
+        
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            // Format and print the live data to the screen
+            dataDiv.innerText = `
+🔥 TRANSACTIONS PER SECOND: ${data.transactions_per_second}
+Total Processed: ${data.total_transactions}
+Unique Users (HyperLogLog): ${data.unique_users}
+Running Avg Amount: $${data.running_avg_amount}
+Total Volume: $${data.running_total_amount}
+
+📊 Category Breakdown (Count-Min Sketch):
+${JSON.stringify(data.category_distribution, null, 2)}
+            `;
+        };
+
+        ws.onclose = () => dataDiv.innerText = "\nDisconnected from server.";
+    </script>
+</body>
+</html>

@@ -1,52 +1,77 @@
-import duckdb
+"""
+Exact_engine.py
+----------------
+Executes EXACT analytical queries using DuckDB.
+"""
+
 import time
-import os
+import duckdb
+import pandas as pd
+from typing import Optional, Dict, Any
 
 class ExactEngine:
-    def __init__(self, db_path="data/ecommerce.parquet"):
-        self.con = duckdb.connect(database=':memory:')
-        
-        # BULLETPROOF PATH LOGIC: Get the exact folder this script is in
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = os.path.join(current_dir, "data", "ecommerce.parquet")
-        
-        try:
-            self.con.execute(f"CREATE VIEW transactions AS SELECT * FROM read_parquet('{full_path}')")
-            print(f"DuckDB Successfully loaded data from: {full_path}")
-        except duckdb.Error as e:
-            print(f"Warning: Could not load dataset at {full_path}. Error: {e}")
+    def __init__(self, parquet_path: str):
+        self.parquet_path = parquet_path
+        self.conn = duckdb.connect(database=":memory:")
 
-    def run_query(self, query_type, column, group_by=None):
-        # 1. SECURITY & WHITELISTING (Prevent weird queries)
-        allowed_queries = ["COUNT", "SUM", "AVG"]
-        if query_type.upper() not in allowed_queries:
-            raise ValueError(f"Unsupported query type: {query_type}. Allowed: {allowed_queries}")
+        # Load Parquet into a DuckDB table for fast SQL queries
+        self.conn.execute(f"""
+            CREATE TABLE transactions AS
+            SELECT * FROM read_parquet('{parquet_path.replace(chr(92), '/')}')
+        """)
 
-        # 2. BUILD THE SQL
-        if group_by:
-            sql = f"SELECT {group_by}, {query_type.upper()}({column}) FROM transactions GROUP BY {group_by}"
-        else:
-            sql = f"SELECT {query_type.upper()}({column}) FROM transactions"
+        result = self.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()
+        self.total_rows = result[0]
+        print(f"✅ ExactEngine (DuckDB) loaded Read/Write table from: {parquet_path}")
 
-        # 3. GRACEFUL EXECUTION (Catching DuckDB crashes)
-        try:
-            start_time = time.perf_counter()
-            raw_result = self.con.execute(sql).fetchall()
-            end_time = time.perf_counter()
-            
-        except duckdb.BinderException as e:
-            # This catches "Column does not exist" errors perfectly
-            raise ValueError(f"Database Error: Double-check your column names! Details: {str(e)}")
-        except duckdb.Error as e:
-            # This catches any other random database crash
-            raise ValueError(f"DuckDB Execution Error: {str(e)}")
+    def count(self, column: str = "*", where: Optional[str] = None) -> Dict[str, Any]:
+        where_clause = f"WHERE {where}" if where else ""
+        sql = f"SELECT COUNT({column}) FROM transactions {where_clause}"
+        start = time.perf_counter()
+        result = self.conn.execute(sql).fetchone()[0]
+        elapsed = time.perf_counter() - start
+        return {"query_type": "COUNT", "result": int(result), "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
 
-        # 4. FORMAT RESULTS
-        execution_time_ms = (end_time - start_time) * 1000  
-        
-        if not group_by and raw_result:
-            result_value = raw_result[0][0]
-        else:
-            result_value = raw_result
+    def count_distinct(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
+        where_clause = f"WHERE {where}" if where else ""
+        sql = f"SELECT COUNT(DISTINCT {column}) FROM transactions {where_clause}"
+        start = time.perf_counter()
+        result = self.conn.execute(sql).fetchone()[0]
+        elapsed = time.perf_counter() - start
+        return {"query_type": "COUNT_DISTINCT", "result": int(result), "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
 
-        return result_value, execution_time_ms
+    def sum(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
+        where_clause = f"WHERE {where}" if where else ""
+        sql = f"SELECT SUM({column}) FROM transactions {where_clause}"
+        start = time.perf_counter()
+        result = self.conn.execute(sql).fetchone()[0]
+        elapsed = time.perf_counter() - start
+        return {"query_type": "SUM", "result": round(float(result), 2) if result else 0, "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
+
+    def avg(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
+        where_clause = f"WHERE {where}" if where else ""
+        sql = f"SELECT AVG({column}) FROM transactions {where_clause}"
+        start = time.perf_counter()
+        result = self.conn.execute(sql).fetchone()[0]
+        elapsed = time.perf_counter() - start
+        return {"query_type": "AVG", "result": round(float(result), 2) if result else 0, "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
+
+    def group_by(self, group_column: str, agg_column: str, agg_func: str = "AVG", where: Optional[str] = None) -> Dict[str, Any]:
+        where_clause = f"WHERE {where}" if where else ""
+        sql = f"SELECT {group_column}, {agg_func}({agg_column}) as agg_value FROM transactions {where_clause} GROUP BY {group_column} ORDER BY {group_column}"
+        start = time.perf_counter()
+        rows = self.conn.execute(sql).fetchall()
+        elapsed = time.perf_counter() - start
+        result = {str(row[0]): round(float(row[1]), 2) for row in rows}
+        return {"query_type": "GROUP_BY", "result": result, "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
+
+    def get_columns(self):
+        info = self.conn.execute("DESCRIBE transactions").fetchall()
+        return [{"name": row[0], "type": row[1]} for row in info]
+
+    def get_sample_rows(self, n: int = 5):
+        rows = self.conn.execute(f"SELECT * FROM transactions LIMIT {n}").fetchdf()
+        return rows.to_dict(orient="records")
+
+    def get_dataframe(self) -> pd.DataFrame:
+        return self.conn.execute("SELECT * FROM transactions").fetchdf()
