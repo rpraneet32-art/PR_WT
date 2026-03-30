@@ -40,22 +40,36 @@ class ExactEngine:
         elapsed = time.perf_counter() - start
         return {"query_type": "COUNT_DISTINCT", "result": int(result), "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
 
-    def sum(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
-        where_clause = f"WHERE {where}" if where else ""
-        sql = f"SELECT SUM({column}) FROM transactions {where_clause}"
-        start = time.perf_counter()
-        result = self.conn.execute(sql).fetchone()[0]
-        elapsed = time.perf_counter() - start
-        return {"query_type": "SUM", "result": round(float(result), 2) if result else 0, "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
+    def sum(self, column, where=None):
+        # This line must be indented!
+        sql = f"SELECT SUM({column}::DOUBLE) FROM transactions"
+        if where:
+            sql += f" WHERE {where}"
+        
+        start_time = time.perf_counter()
+        try:
+            result = self.conn.execute(sql).fetchone()[0]
+        except Exception as e:
+            # This is the 'bulletproof' part
+            return {"error": f"Column '{column}' cannot be summed. Is it a number?"}, 0
+            
+        end_time = time.perf_counter()
+        return result or 0, (end_time - start_time) * 1000
 
-    def avg(self, column: str, where: Optional[str] = None) -> Dict[str, Any]:
-        where_clause = f"WHERE {where}" if where else ""
-        sql = f"SELECT AVG({column}) FROM transactions {where_clause}"
-        start = time.perf_counter()
-        result = self.conn.execute(sql).fetchone()[0]
-        elapsed = time.perf_counter() - start
-        return {"query_type": "AVG", "result": round(float(result), 2) if result else 0, "time_ms": round(elapsed * 1000, 2), "engine": "exact"}
-
+    def avg(self, column, where=None):
+        # This line must also be indented!
+        sql = f"SELECT AVG({column}::DOUBLE) FROM transactions"
+        if where:
+            sql += f" WHERE {where}"
+        
+        start_time = time.perf_counter()
+        try:
+            result = self.conn.execute(sql).fetchone()[0]
+        except Exception as e:
+            return {"error": f"Cannot calculate Average for '{column}'."}, 0
+            
+        end_time = time.perf_counter()
+        return result or 0, (end_time - start_time) * 1000
     def group_by(self, group_column: str, agg_column: str, agg_func: str = "AVG", where: Optional[str] = None) -> Dict[str, Any]:
         where_clause = f"WHERE {where}" if where else ""
         sql = f"SELECT {group_column}, {agg_func}({agg_column}) as agg_value FROM transactions {where_clause} GROUP BY {group_column} ORDER BY {group_column}"
